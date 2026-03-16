@@ -71,13 +71,22 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     SDPA attention with sliding window support.
     q, k, v are (B, H, T, D) format.
     """
+    if enable_gqa:
+        # Manual GQA: repeat k/v to match queries
+        # (B, H_kv, T, D) -> (B, H_q, T, D)
+        H_q, H_kv = q.size(1), k.size(1)
+        assert H_q % H_kv == 0
+        ratio = H_q // H_kv
+        k = k.repeat_interleave(ratio, dim=1)
+        v = v.repeat_interleave(ratio, dim=1)
+
     Tq = q.size(2)
     Tk = k.size(2)
     window = window_size[0]
 
     # Full context, same length
     if (window < 0 or window >= Tq) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
     # Single token generation
     if Tq == 1:
@@ -86,7 +95,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
             start = max(0, Tk - (window + 1))
             k = k[:, :, start:, :]
             v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        return F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
     # Need explicit mask for sliding window/chunk inference
     device = q.device
@@ -99,7 +108,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     if window >= 0 and window < Tk:
         mask = mask & ((row_idx - col_idx) <= window)
 
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
 # =============================================================================
 # Public API: Same interface as FA3
