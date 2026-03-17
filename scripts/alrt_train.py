@@ -1,5 +1,6 @@
 """
-Retrain a Graph Recursive GPT model.
+Train ALRT from scratch.
+Adapted from scripts/base_train.py
 """
 
 import os
@@ -27,19 +28,28 @@ print_banner()
 
 # -----------------------------------------------------------------------------
 # CLI arguments
-parser = argparse.ArgumentParser(description="Retrain graph recursive model")
+parser = argparse.ArgumentParser(description="Train ALRT from scratch")
 parser.add_argument("--run", type=str, default="dummy")
 parser.add_argument("--device-type", type=str, default="")
-parser.add_argument("--checkpoint-dir", type=str, required=True)
-parser.add_argument("--resume-from-step", type=int, required=True)
-parser.add_argument("--n-steps", type=int, default=-1)
+# Model architecture
+parser.add_argument("--depth", type=int, default=16)
+parser.add_argument("--aspect-ratio", type=int, default=8)
+parser.add_argument("--max-seq-len", type=int, default=64)
+# ALRT specific
+parser.add_argument("--n-steps", type=int, default=8)
+parser.add_argument("--top-fixed", type=int, default=2)
+parser.add_argument("--bottom-fixed", type=int, default=2)
 parser.add_argument("--ponder-weight", type=float, default=0.01)
+# Optimization
 parser.add_argument("--device-batch-size", type=int, default=16)
-parser.add_argument("--num-iterations", type=int, default=1000)
-parser.add_argument("--dependency-lr", type=float, default=0.01)
-parser.add_argument("--eval-every", type=int, default=250)
-parser.add_argument("--eval-tokens", type=int, default=1024*1024)
-parser.add_argument("--save-every", type=int, default=-1)
+parser.add_argument("--num-iterations", type=int, default=500)
+parser.add_argument("--matrix-lr", type=float, default=0.02)
+parser.add_argument("--dependency-lr", type=float, default=0.05)
+parser.add_argument("--warmup-steps", type=int, default=40)
+# Evaluation
+parser.add_argument("--eval-every", type=int, default=100)
+parser.add_argument("--eval-tokens", type=int, default=4096)
+parser.add_argument("--model-tag", type=str, default="alrt_scratch")
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -54,16 +64,28 @@ tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 
 # -----------------------------------------------------------------------------
-# Load the Model
-model_data, optimizer_data, meta_data = load_checkpoint(args.checkpoint_dir, args.resume_from_step, device, load_optimizer=False, rank=ddp_rank)
-config = GPTConfig(**meta_data["model_config"])
+# Model
+n_embd = args.depth * args.aspect_ratio
+head_dim = 128
+n_head = n_embd // head_dim
+if n_head == 0: n_head = 1 # ensure at least 1 head
+n_kv_head = n_head # standard GQA for small models
+
+config = GPTConfig(
+    n_layer=args.depth,
+    n_embd=n_embd,
+    n_head=n_head,
+    n_kv_head=n_kv_head,
+    sequence_len=args.max_seq_len,
+    vocab_size=tokenizer.get_vocab_size(),
+)
 model = RecursiveGPT(config)
-model.load_state_dict(model_data, strict=False)
+model.set_n_steps(args.n_steps, top_fixed=args.top_fixed, bottom_fixed=args.bottom_fixed)
 model.to(device)
 
 # -----------------------------------------------------------------------------
 # Optimizer
-optimizer = model.setup_optimizer(matrix_lr=0.02, adapter_lr=args.dependency_lr)
+optimizer = model.setup_optimizer(matrix_lr=args.matrix_lr, adapter_lr=args.dependency_lr)
 
 # -----------------------------------------------------------------------------
 # DataLoaders
@@ -72,9 +94,8 @@ build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokeni
 
 # -----------------------------------------------------------------------------
 # Training loop
-step = args.resume_from_step
+step = 0
 num_iterations = args.num_iterations
-n_steps = args.n_steps if args.n_steps > 0 else config.n_layer
 
 while step < num_iterations:
     t0 = time.time()
@@ -94,8 +115,20 @@ while step < num_iterations:
     # Optimization step
     optimizer.zero_grad()
     x, y = next(train_loader)
-    loss, stats = model(x, y, return_ponder_stats=True, ponder_weight=args.ponder_weight, n_steps=n_steps)
+    
+    # Learning rate warmup (simple linear)
+    curr_lr = args.matrix_lr * min(1.0, (step + 1) / args.warmup_steps)
+    for group in optimizer.param_groups:
+        if group.get('name') != 'router': # keep router LR stable or also warm it up?
+            group['lr'] = curr_lr
+
+    loss, stats = model(x, y, return_ponder_stats=True, ponder_weight=args.ponder_weight)
     loss.backward()
+    
+    # Apply gradient mask to dependency_matrix
+    if hasattr(model, 'dependency_mask') and model.dependency_matrix.grad is not None:
+        model.dependency_matrix.grad.mul_(model.dependency_mask)
+        
     optimizer.step()
     
     t1 = time.time()
@@ -107,4 +140,5 @@ while step < num_iterations:
 
 # Final save
 if master_process:
-    save_checkpoint(args.checkpoint_dir, step, model.state_dict(), optimizer.state_dict(), {"model_config": asdict(config), "step": step}, rank=ddp_rank)
+    checkpoint_dir = os.path.join(os.environ.get("NANOCHAT_BASE_DIR", "."), "scratch_checkpoints", args.model_tag)
+    save_checkpoint(checkpoint_dir, step, model.state_dict(), optimizer.state_dict(), {"model_config": asdict(config), "step": step}, rank=ddp_rank)
